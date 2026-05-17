@@ -1,15 +1,327 @@
 import json
 
+single_cell_source = """
+import sys
+import subprocess
+
+# 1. Install required packages automatically
+def install_dependencies():
+    packages = ["playwright", "nest-asyncio", "faker"]
+    for pkg in packages:
+        try:
+            __import__(pkg.replace("-", "_"))
+        except ImportError:
+            print(f"Installing {pkg}...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+
+    # Install chromium for playwright
+    print("Ensuring Playwright Chromium is installed...")
+    subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
+
+install_dependencies()
+
+# 2. Imports and Setup
+import asyncio
+import re
+import nest_asyncio
+from faker import Faker
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+
+nest_asyncio.apply()
+
+# 3. Core Meeting Logic
+async def log(msg: str):
+    print(msg)
+
+async def find_first(page, selectors, timeout=8000):
+    for s in selectors:
+        try:
+            loc = page.locator(s)
+            await loc.first.wait_for(state="visible", timeout=timeout)
+            return loc.first
+        except Exception:
+            continue
+    return None
+
+async def join_meeting(tag: str, page, meeting_url: str, passcode: str,
+                       name: str, wait_seconds: int,
+                       joined_event: asyncio.Event,
+                       winner_page: dict, winner_lock: asyncio.Lock,
+                       admitted_pages: list, admitted_lock: asyncio.Lock):
+    try:
+        await log(f"{tag} 🌐 Navigating to meeting URL ...")
+        await page.goto(meeting_url, timeout=120000, wait_until="domcontentloaded")
+        await page.wait_for_timeout(3000)
+
+        await page.evaluate('''
+            () => document.querySelectorAll('[id*="onetrust"],[class*="onetrust"]')
+                          .forEach(e => e.remove())
+        ''')
+
+        try:
+            cancel_btn = page.locator("button:has-text('Cancel')")
+            await cancel_btn.wait_for(state="visible", timeout=5000)
+            await cancel_btn.click()
+            await log(f"{tag} ✅ Dismissed popup.")
+        except PlaywrightTimeoutError:
+            pass
+
+        await page.wait_for_timeout(1000)
+
+        try:
+            join_browser_btn = page.locator("button:has-text('Join from browser')")
+            await join_browser_btn.wait_for(state="visible", timeout=8000)
+            await join_browser_btn.click()
+        except PlaywrightTimeoutError:
+            pass
+
+        await page.wait_for_timeout(4000)
+
+        pass_input = await find_first(page, [
+            "#input-for-pwd", 'input[id="input-for-pwd"]', 'input[placeholder*="passcode"]',
+            'input[type="password"]'
+        ], timeout=5000)
+        if pass_input:
+            await pass_input.click(force=True)
+            await pass_input.fill(passcode)
+            await log(f"{tag} 🔑 Passcode entered.")
+
+        name_input = await find_first(page, [
+            "#input-for-name", "#inputname", 'input[placeholder*="Your Name"]',
+        ], timeout=8000)
+        if name_input:
+            await name_input.click(force=True)
+            await name_input.fill("")
+            await name_input.fill(name)
+            await log(f"{tag} 📝 Name set to '{name}'.")
+
+        await page.wait_for_timeout(500)
+
+        try:
+            cam_btn = await find_first(page, [
+                "button#preview-video-control-button",
+                "button[aria-label='Stop Video']",
+                "button[aria-label='Turn off video']",
+                "button[aria-label='Start Video']",
+                "button:has-text('Stop Video')",
+            ], timeout=3000)
+            if cam_btn:
+                aria_label = await cam_btn.get_attribute("aria-label") or ""
+                btn_text   = await cam_btn.text_content() or ""
+                if "Stop Video" in aria_label or "Turn off video" in aria_label or "Stop Video" in btn_text:
+                    await cam_btn.click(force=True)
+                    await log(f"{tag} 📷 Camera off (pre-join).")
+                elif "Start Video" in aria_label or "Start Video" in btn_text:
+                    await log(f"{tag} 📷 Camera already off (pre-join).")
+        except Exception:
+            pass
+
+        try:
+            mute_btn = await find_first(page, [
+                "button#preview-audio-control-button",
+                "button[aria-label='Mute']",
+                "button[aria-label='Unmute']",
+            ], timeout=3000)
+            if mute_btn:
+                aria_label = await mute_btn.get_attribute("aria-label") or ""
+                if "Mute" in aria_label and "Unmute" not in aria_label:
+                    await mute_btn.click(force=True)
+                    await log(f"{tag} 🎤 Muted (pre-join).")
+                elif "Unmute" in aria_label:
+                    await log(f"{tag} 🎤 Already muted (pre-join).")
+        except Exception:
+            pass
+
+        await page.wait_for_timeout(300)
+
+        join_btn = await find_first(page, [
+            'button.preview-join-button',
+            'button[aria-label="Join"]',
+            'button:has-text("Join")',
+        ], timeout=6000)
+        if join_btn:
+            await join_btn.click(force=True)
+            await log(f"{tag} ✅ Clicked Join!")
+
+        await page.wait_for_timeout(4000)
+
+        try:
+            video_btn = await find_first(page, [
+                "button[aria-label='Stop Video']",
+                "button[aria-label='Turn off video']",
+                "button[aria-label='Start Video']",
+            ], timeout=5000)
+            if video_btn:
+                aria_label = await video_btn.get_attribute("aria-label") or ""
+                if "Stop Video" in aria_label or "Turn off video" in aria_label:
+                    await video_btn.click(force=True)
+                    await log(f"{tag} 📷 Camera turned OFF (in-meeting).")
+        except Exception:
+            pass
+
+        try:
+            mic_btn = await find_first(page, [
+                "button[aria-label='Mute']",
+                "button[aria-label='Unmute']",
+                "button[aria-label='Join Audio']",
+            ], timeout=3000)
+            if mic_btn:
+                aria_label = await mic_btn.get_attribute("aria-label") or ""
+                if "Unmute" in aria_label:
+                    await log(f"{tag} 🎤 Microphone is already muted (in-meeting).")
+                elif "Join Audio" in aria_label:
+                    await mic_btn.click(force=True)
+                    await log(f"{tag} 🎤 Joined audio (in-meeting).")
+                    await page.wait_for_timeout(2000)
+                    mute_btn = await find_first(page, ["button[aria-label='Mute']", "button[aria-label='Unmute']"], timeout=3000)
+                    if mute_btn and "Mute" in (await mute_btn.get_attribute("aria-label") or ""):
+                        await mute_btn.click(force=True)
+                elif "Mute" in aria_label:
+                    await mic_btn.click(force=True)
+        except Exception:
+            pass
+
+        await log(f"{tag} ⏳ Waiting to be admitted ...")
+        waited = 0
+        while waited < 600:
+            if joined_event.is_set():
+                return
+
+            in_meeting = False
+            for selector in [".video-avatar__avatar", "button[aria-label='Leave']", "#wc-footer"]:
+                try:
+                    if await page.locator(selector).count() > 0:
+                        in_meeting = True
+                        break
+                except Exception:
+                    pass
+
+            if in_meeting:
+                async with admitted_lock:
+                    if page not in admitted_pages:
+                        admitted_pages.append(page)
+                async with winner_lock:
+                    if not joined_event.is_set():
+                        joined_event.set()
+                        winner_page["page"] = page
+                        await log(f"🏆 {tag} is the WINNER — '{name}'.")
+                return
+            await page.wait_for_timeout(10000)
+            waited += 10
+    except Exception as e:
+        if not joined_event.is_set():
+            await log(f"{tag} ❌ Error: {e}")
+
+# 4. Interactive Configuration
+meeting_id = input("Enter Meeting ID (numbers only): ").strip()
+passcode = input("Enter Passcode: ").strip()
+
+while True:
+    try:
+        num_tabs = int(input("Enter number of bots (10 to 100): ").strip())
+        if 10 <= num_tabs <= 100:
+            break
+        else:
+            print("Please enter a number between 10 and 100.")
+    except ValueError:
+        print("Invalid input. Please enter an integer.")
+
+while True:
+    try:
+        stay_minutes = int(input("Enter duration to stay in meeting (in minutes): ").strip())
+        if stay_minutes > 0:
+            break
+        else:
+            print("Duration must be greater than 0.")
+    except ValueError:
+        print("Invalid input. Please enter an integer.")
+
+MEETING_URL = f"https://zoom.us/wc/{meeting_id}/join?pwd={passcode}"
+
+faker_in = Faker('en_IN')
+TAB_NAMES = [faker_in.name() for _ in range(num_tabs)]
+HEADLESS = True
+
+print(f"\\nPrepared to launch {num_tabs} bots with names like: {TAB_NAMES[:3]}...")
+print(f"Joining meeting {meeting_id} for {stay_minutes} minutes.\\n")
+
+# 5. Coordinator Loop
+async def run_bots():
+    joined_event = asyncio.Event()
+    session_done_event = asyncio.Event()
+    winner_lock = asyncio.Lock()
+    winner_page = {"page": None}
+    admitted_pages = []
+    admitted_lock = asyncio.Lock()
+
+    LAUNCH_ARGS = [
+        "--no-sandbox", "--disable-setuid-sandbox", "--use-fake-ui-for-media-stream",
+        "--use-fake-device-for-media-stream", "--disable-gpu", "--window-size=1280,720"
+    ]
+
+    async def launch_and_join(index, name):
+        tag = f"[Bot {index + 1}]"
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=HEADLESS, args=LAUNCH_ARGS)
+            context = await browser.new_context(permissions=["camera", "microphone"])
+            page = await context.new_page()
+            try:
+                await join_meeting(
+                    tag, page, MEETING_URL, passcode, name, stay_minutes * 60,
+                    joined_event, winner_page, winner_lock, admitted_pages, admitted_lock
+                )
+                if joined_event.is_set() and winner_page.get("page") is page:
+                    await session_done_event.wait()
+            finally:
+                if not joined_event.is_set() or winner_page.get("page") is not page:
+                    await browser.close()
+
+    tasks = [asyncio.create_task(launch_and_join(i, TAB_NAMES[i])) for i in range(num_tabs)]
+
+    try:
+        await asyncio.wait_for(joined_event.wait(), timeout=660)
+    except asyncio.TimeoutError:
+        print("❌ No tab admitted.")
+        for t in tasks: t.cancel()
+        return
+
+    print(f"🟢 In meeting! Staying for {stay_minutes} minute(s).")
+
+    stay_seconds = stay_minutes * 60
+    for remaining in range(stay_seconds, 0, -30):
+        mins, secs = divmod(remaining, 60)
+        print(f"⏱️  {mins:02d}:{secs:02d} remaining ...")
+        await asyncio.sleep(min(30, remaining))
+
+    print("👋 Time is up! Leaving the meeting ...")
+    try:
+        wp = winner_page["page"]
+        leave = wp.locator("button[aria-label='Leave'], button[aria-label='End'], button:has-text('Leave')")
+        await leave.first.wait_for(state="visible", timeout=5000)
+        await leave.first.click()
+        await wp.wait_for_timeout(1500)
+        confirm = wp.locator("button:has-text('Leave Meeting'), button:has-text('Leave for Everyone')")
+        await confirm.first.click()
+        print("✅ Left the meeting.")
+    except Exception as e:
+        print(f"⚠️ Leave error: {e}")
+
+    session_done_event.set()
+    await asyncio.sleep(2)
+    for t in tasks: t.cancel()
+
+# Start
+await run_bots()
+"""
+
 notebook = {
     "cells": [
         {
             "cell_type": "markdown",
             "metadata": {},
             "source": [
-                "# Zoom Bot - Jupyter Notebook Edition\n",
-                "This notebook contains the core logic for the Zoom bot, allowing you to run it directly from a Jupyter environment.\n",
-                "\n",
-                "**First, run the cell below to install Playwright and configure the asyncio event loop.**"
+                "# Zoom Bot (All-in-One)\n",
+                "This single cell will automatically install all dependencies, prompt you for the Meeting ID/Passcode/Details, and run the bots."
             ]
         },
         {
@@ -17,353 +329,7 @@ notebook = {
             "execution_count": None,
             "metadata": {},
             "outputs": [],
-            "source": [
-                "!pip install playwright nest-asyncio faker\n",
-                "!playwright install chromium\n",
-                "\n",
-                "import nest_asyncio\n",
-                "nest_asyncio.apply()"
-            ]
-        },
-        {
-            "cell_type": "markdown",
-            "metadata": {},
-            "source": [
-                "**Next, define the core functions needed to join the meeting and handle the UI toggles.**"
-            ]
-        },
-        {
-            "cell_type": "code",
-            "execution_count": None,
-            "metadata": {},
-            "outputs": [],
-            "source": [
-                "import asyncio\n",
-                "import re\n",
-                "from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError\n",
-                "\n",
-                "async def log(msg: str):\n",
-                "    print(msg)\n",
-                "\n",
-                "async def find_first(page, selectors, timeout=8000):\n",
-                "    for s in selectors:\n",
-                "        try:\n",
-                "            loc = page.locator(s)\n",
-                "            await loc.first.wait_for(state=\"visible\", timeout=timeout)\n",
-                "            return loc.first\n",
-                "        except Exception:\n",
-                "            continue\n",
-                "    return None\n",
-                "\n",
-                "async def join_meeting(tag: str, page, meeting_url: str, passcode: str,\n",
-                "                       name: str, wait_seconds: int,\n",
-                "                       joined_event: asyncio.Event,\n",
-                "                       winner_page: dict, winner_lock: asyncio.Lock,\n",
-                "                       admitted_pages: list, admitted_lock: asyncio.Lock):\n",
-                "    try:\n",
-                "        await log(f\"{tag} 🌐 Navigating to meeting URL ...\")\n",
-                "        await page.goto(meeting_url, timeout=120000, wait_until=\"domcontentloaded\")\n",
-                "        await page.wait_for_timeout(3000)\n",
-                "\n",
-                "        # Nuke cookie banners\n",
-                "        await page.evaluate(\"\"\"\n",
-                "            () => document.querySelectorAll('[id*=\"onetrust\"],[class*=\"onetrust\"]')\n",
-                "                          .forEach(e => e.remove())\n",
-                "        \"\"\")\n",
-                "\n",
-                "        # Dismiss popup\n",
-                "        try:\n",
-                "            cancel_btn = page.locator(\"button:has-text('Cancel')\")\n",
-                "            await cancel_btn.wait_for(state=\"visible\", timeout=5000)\n",
-                "            await cancel_btn.click()\n",
-                "            await log(f\"{tag} ✅ Dismissed popup.\")\n",
-                "        except PlaywrightTimeoutError:\n",
-                "            pass\n",
-                "\n",
-                "        await page.wait_for_timeout(1000)\n",
-                "\n",
-                "        # Click Join from browser\n",
-                "        try:\n",
-                "            join_browser_btn = page.locator(\"button:has-text('Join from browser')\")\n",
-                "            await join_browser_btn.wait_for(state=\"visible\", timeout=8000)\n",
-                "            await join_browser_btn.click()\n",
-                "        except PlaywrightTimeoutError:\n",
-                "            pass\n",
-                "\n",
-                "        await page.wait_for_timeout(4000)\n",
-                "\n",
-                "        # Passcode\n",
-                "        pass_input = await find_first(page, [\n",
-                "            \"#input-for-pwd\", 'input[id=\"input-for-pwd\"]', 'input[placeholder*=\"passcode\"]',\n",
-                "            'input[type=\"password\"]'\n",
-                "        ], timeout=5000)\n",
-                "        if pass_input:\n",
-                "            await pass_input.click(force=True)\n",
-                "            await pass_input.fill(passcode)\n",
-                "            await log(f\"{tag} 🔑 Passcode entered.\")\n",
-                "\n",
-                "        # Name\n",
-                "        name_input = await find_first(page, [\n",
-                "            \"#input-for-name\", \"#inputname\", 'input[placeholder*=\"Your Name\"]',\n",
-                "        ], timeout=8000)\n",
-                "        if name_input:\n",
-                "            await name_input.click(force=True)\n",
-                "            await name_input.fill(\"\")\n",
-                "            await name_input.fill(name)\n",
-                "            await log(f\"{tag} 📝 Name set to '{name}'.\")\n",
-                "\n",
-                "        await page.wait_for_timeout(500)\n",
-                "\n",
-                "        # Camera off (pre-join)\n",
-                "        try:\n",
-                "            cam_btn = await find_first(page, [\n",
-                "                \"button#preview-video-control-button\",\n",
-                "                \"button[aria-label='Stop Video']\",\n",
-                "                \"button[aria-label='Turn off video']\",\n",
-                "                \"button[aria-label='Start Video']\",\n",
-                "                \"button:has-text('Stop Video')\",\n",
-                "            ], timeout=3000)\n",
-                "            if cam_btn:\n",
-                "                aria_label = await cam_btn.get_attribute(\"aria-label\") or \"\"\n",
-                "                btn_text   = await cam_btn.text_content() or \"\"\n",
-                "                if \"Stop Video\" in aria_label or \"Turn off video\" in aria_label or \"Stop Video\" in btn_text:\n",
-                "                    await cam_btn.click(force=True)\n",
-                "                    await log(f\"{tag} 📷 Camera off (pre-join).\")\n",
-                "                elif \"Start Video\" in aria_label or \"Start Video\" in btn_text:\n",
-                "                    await log(f\"{tag} 📷 Camera already off (pre-join).\")\n",
-                "        except Exception:\n",
-                "            pass\n",
-                "\n",
-                "        # Mute mic (pre-join)\n",
-                "        try:\n",
-                "            mute_btn = await find_first(page, [\n",
-                "                \"button#preview-audio-control-button\",\n",
-                "                \"button[aria-label='Mute']\",\n",
-                "                \"button[aria-label='Unmute']\",\n",
-                "            ], timeout=3000)\n",
-                "            if mute_btn:\n",
-                "                aria_label = await mute_btn.get_attribute(\"aria-label\") or \"\"\n",
-                "                if \"Mute\" in aria_label and \"Unmute\" not in aria_label:\n",
-                "                    await mute_btn.click(force=True)\n",
-                "                    await log(f\"{tag} 🎤 Muted (pre-join).\")\n",
-                "                elif \"Unmute\" in aria_label:\n",
-                "                    await log(f\"{tag} 🎤 Already muted (pre-join).\")\n",
-                "        except Exception:\n",
-                "            pass\n",
-                "\n",
-                "        await page.wait_for_timeout(300)\n",
-                "\n",
-                "        # Join\n",
-                "        join_btn = await find_first(page, [\n",
-                "            'button.preview-join-button',\n",
-                "            'button[aria-label=\"Join\"]',\n",
-                "            'button:has-text(\"Join\")',\n",
-                "        ], timeout=6000)\n",
-                "        if join_btn:\n",
-                "            await join_btn.click(force=True)\n",
-                "            await log(f\"{tag} ✅ Clicked Join!\")\n",
-                "\n",
-                "        await page.wait_for_timeout(4000)\n",
-                "\n",
-                "        # Post-join: camera off\n",
-                "        try:\n",
-                "            video_btn = await find_first(page, [\n",
-                "                \"button[aria-label='Stop Video']\",\n",
-                "                \"button[aria-label='Turn off video']\",\n",
-                "                \"button[aria-label='Start Video']\",\n",
-                "            ], timeout=5000)\n",
-                "            if video_btn:\n",
-                "                aria_label = await video_btn.get_attribute(\"aria-label\") or \"\"\n",
-                "                if \"Stop Video\" in aria_label or \"Turn off video\" in aria_label:\n",
-                "                    await video_btn.click(force=True)\n",
-                "                    await log(f\"{tag} 📷 Camera turned OFF (in-meeting).\")\n",
-                "        except Exception:\n",
-                "            pass\n",
-                "\n",
-                "        # Post-join: mic off\n",
-                "        try:\n",
-                "            mic_btn = await find_first(page, [\n",
-                "                \"button[aria-label='Mute']\",\n",
-                "                \"button[aria-label='Unmute']\",\n",
-                "                \"button[aria-label='Join Audio']\",\n",
-                "            ], timeout=3000)\n",
-                "            if mic_btn:\n",
-                "                aria_label = await mic_btn.get_attribute(\"aria-label\") or \"\"\n",
-                "                if \"Unmute\" in aria_label:\n",
-                "                    await log(f\"{tag} 🎤 Microphone is already muted (in-meeting).\")\n",
-                "                elif \"Join Audio\" in aria_label:\n",
-                "                    await mic_btn.click(force=True)\n",
-                "                    await log(f\"{tag} 🎤 Joined audio (in-meeting).\")\n",
-                "                    await page.wait_for_timeout(2000)\n",
-                "                    mute_btn = await find_first(page, [\"button[aria-label='Mute']\", \"button[aria-label='Unmute']\"], timeout=3000)\n",
-                "                    if mute_btn and \"Mute\" in (await mute_btn.get_attribute(\"aria-label\") or \"\"):\n",
-                "                        await mute_btn.click(force=True)\n",
-                "                elif \"Mute\" in aria_label:\n",
-                "                    await mic_btn.click(force=True)\n",
-                "        except Exception:\n",
-                "            pass\n",
-                "\n",
-                "        # Wait for admission\n",
-                "        await log(f\"{tag} ⏳ Waiting to be admitted ...\")\n",
-                "        waited = 0\n",
-                "        while waited < 600:\n",
-                "            if joined_event.is_set():\n",
-                "                return\n",
-                "            \n",
-                "            in_meeting = False\n",
-                "            for selector in [\".video-avatar__avatar\", \"button[aria-label='Leave']\", \"#wc-footer\"]:\n",
-                "                try:\n",
-                "                    if await page.locator(selector).count() > 0:\n",
-                "                        in_meeting = True\n",
-                "                        break\n",
-                "                except Exception:\n",
-                "                    pass\n",
-                "            \n",
-                "            if in_meeting:\n",
-                "                async with admitted_lock:\n",
-                "                    if page not in admitted_pages:\n",
-                "                        admitted_pages.append(page)\n",
-                "                async with winner_lock:\n",
-                "                    if not joined_event.is_set():\n",
-                "                        joined_event.set()\n",
-                "                        winner_page[\"page\"] = page\n",
-                "                        await log(f\"🏆 {tag} is the WINNER — '{name}'.\")\n",
-                "                return\n",
-                "            await page.wait_for_timeout(10000)\n",
-                "            waited += 10\n",
-                "    except Exception as e:\n",
-                "        if not joined_event.is_set():\n",
-                "            await log(f\"{tag} ❌ Error: {e}\")\n"
-            ]
-        },
-        {
-            "cell_type": "markdown",
-            "metadata": {},
-            "source": [
-                "**Configure inputs and run the bot coordinator!**\n",
-                "\n",
-                "When you run this cell, you will be prompted to enter your Meeting ID, Passcode, number of bots (10-100), and duration."
-            ]
-        },
-        {
-            "cell_type": "code",
-            "execution_count": None,
-            "metadata": {},
-            "outputs": [],
-            "source": [
-                "try:\n",
-                "    from faker import Faker\n",
-                "except ImportError:\n",
-                "    import subprocess\n",
-                "    import sys\n",
-                "    print(\"Installing faker...\")\n",
-                "    subprocess.check_call([sys.executable, \"-m\", \"pip\", \"install\", \"faker\"])\n",
-                "    from faker import Faker\n",
-                "\n",
-                "# Ask for meeting ID\n",
-                "meeting_id = input(\"Enter Meeting ID (numbers only): \").strip()\n",
-                "passcode = input(\"Enter Passcode: \").strip()\n",
-                "\n",
-                "# Ask for number of bots with constraints\n",
-                "while True:\n",
-                "    try:\n",
-                "        num_tabs = int(input(\"Enter number of bots (10 to 100): \").strip())\n",
-                "        if 10 <= num_tabs <= 100:\n",
-                "            break\n",
-                "        else:\n",
-                "            print(\"Please enter a number between 10 and 100.\")\n",
-                "    except ValueError:\n",
-                "        print(\"Invalid input. Please enter an integer.\")\n",
-                "\n",
-                "# Ask for duration\n",
-                "while True:\n",
-                "    try:\n",
-                "        stay_minutes = int(input(\"Enter duration to stay in meeting (in minutes): \").strip())\n",
-                "        if stay_minutes > 0:\n",
-                "            break\n",
-                "        else:\n",
-                "            print(\"Duration must be greater than 0.\")\n",
-                "    except ValueError:\n",
-                "        print(\"Invalid input. Please enter an integer.\")\n",
-                "\n",
-                "# Format Meeting URL properly for Web Client\n",
-                "MEETING_URL = f\"https://zoom.us/wc/{meeting_id}/join?pwd={passcode}\"\n",
-                "\n",
-                "# Generate random Indian names\n",
-                "faker_in = Faker('en_IN')\n",
-                "TAB_NAMES = [faker_in.name() for _ in range(num_tabs)]\n",
-                "HEADLESS = True\n",
-                "\n",
-                "print(f\"\\nPrepared to launch {num_tabs} bots with names like: {TAB_NAMES[:3]}...\")\n",
-                "print(f\"Joining meeting {meeting_id} for {stay_minutes} minutes.\\n\")\n",
-                "\n",
-                "async def run_bots():\n",
-                "    joined_event = asyncio.Event()\n",
-                "    session_done_event = asyncio.Event()\n",
-                "    winner_lock = asyncio.Lock()\n",
-                "    winner_page = {\"page\": None}\n",
-                "    admitted_pages = []\n",
-                "    admitted_lock = asyncio.Lock()\n",
-                "    \n",
-                "    LAUNCH_ARGS = [\n",
-                "        \"--no-sandbox\", \"--disable-setuid-sandbox\", \"--use-fake-ui-for-media-stream\",\n",
-                "        \"--use-fake-device-for-media-stream\", \"--disable-gpu\", \"--window-size=1280,720\"\n",
-                "    ]\n",
-                "    \n",
-                "    async def launch_and_join(index, name):\n",
-                "        tag = f\"[Bot {index + 1}]\"\n",
-                "        async with async_playwright() as p:\n",
-                "            browser = await p.chromium.launch(headless=HEADLESS, args=LAUNCH_ARGS)\n",
-                "            context = await browser.new_context(permissions=[\"camera\", \"microphone\"])\n",
-                "            page = await context.new_page()\n",
-                "            try:\n",
-                "                await join_meeting(\n",
-                "                    tag, page, MEETING_URL, passcode, name, stay_minutes * 60,\n",
-                "                    joined_event, winner_page, winner_lock, admitted_pages, admitted_lock\n",
-                "                )\n",
-                "                if joined_event.is_set() and winner_page.get(\"page\") is page:\n",
-                "                    await session_done_event.wait()\n",
-                "            finally:\n",
-                "                if not joined_event.is_set() or winner_page.get(\"page\") is not page:\n",
-                "                    await browser.close()\n",
-                "\n",
-                "    tasks = [asyncio.create_task(launch_and_join(i, TAB_NAMES[i])) for i in range(num_tabs)]\n",
-                "    \n",
-                "    try:\n",
-                "        await asyncio.wait_for(joined_event.wait(), timeout=660)\n",
-                "    except asyncio.TimeoutError:\n",
-                "        print(\"❌ No tab admitted.\")\n",
-                "        for t in tasks: t.cancel()\n",
-                "        return\n",
-                "\n",
-                "    print(f\"🟢 In meeting! Staying for {stay_minutes} minute(s).\")\n",
-                "    \n",
-                "    stay_seconds = stay_minutes * 60\n",
-                "    for remaining in range(stay_seconds, 0, -30):\n",
-                "        mins, secs = divmod(remaining, 60)\n",
-                "        print(f\"⏱️  {mins:02d}:{secs:02d} remaining ...\")\n",
-                "        await asyncio.sleep(min(30, remaining))\n",
-                "        \n",
-                "    print(\"👋 Time is up! Leaving the meeting ...\")\n",
-                "    try:\n",
-                "        wp = winner_page[\"page\"]\n",
-                "        leave = wp.locator(\"button[aria-label='Leave'], button[aria-label='End'], button:has-text('Leave')\")\n",
-                "        await leave.first.wait_for(state=\"visible\", timeout=5000)\n",
-                "        await leave.first.click()\n",
-                "        await wp.wait_for_timeout(1500)\n",
-                "        confirm = wp.locator(\"button:has-text('Leave Meeting'), button:has-text('Leave for Everyone')\")\n",
-                "        await confirm.first.click()\n",
-                "        print(\"✅ Left the meeting.\")\n",
-                "    except Exception as e:\n",
-                "        print(f\"⚠️ Leave error: {e}\")\n",
-                "        \n",
-                "    session_done_event.set()\n",
-                "    await asyncio.sleep(2)\n",
-                "    for t in tasks: t.cancel()\n",
-                "\n",
-                "# Run the bots\n",
-                "await run_bots()"
-            ]
+            "source": [line + "\n" for line in single_cell_source.split('\n')]
         }
     ],
     "metadata": {
