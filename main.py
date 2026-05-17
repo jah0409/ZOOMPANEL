@@ -334,13 +334,22 @@ async def join_meeting(tag: str, page, meeting_url: str, passcode: str,
                 "button#preview-video-control-button",
                 "button[aria-label='Stop Video']",
                 "button[aria-label='Turn off video']",
+                "button[aria-label='Start Video']",
                 "button.preview-video-control",
                 "button[class*='video-preview']",
                 "button:has-text('Stop Video')",
             ], timeout=3000)
             if cam_btn:
-                await cam_btn.click(force=True)
-                await log(queue, f"{tag} 📷 Camera off (pre-join).")
+                aria_label = await cam_btn.get_attribute("aria-label") or ""
+                btn_text   = await cam_btn.text_content() or ""
+                if "Stop Video" in aria_label or "Turn off video" in aria_label or "Stop Video" in btn_text:
+                    await cam_btn.click(force=True)
+                    await log(queue, f"{tag} 📷 Camera off (pre-join).")
+                elif "Start Video" in aria_label or "Start Video" in btn_text:
+                    await log(queue, f"{tag} 📷 Camera already off (pre-join).")
+                else:
+                    await cam_btn.click(force=True)
+                    await log(queue, f"{tag} 📷 Camera toggled (pre-join).")
             else:
                 await page.evaluate("""
                     () => {
@@ -363,11 +372,19 @@ async def join_meeting(tag: str, page, meeting_url: str, passcode: str,
             mute_btn = await find_first(page, [
                 "button#preview-audio-control-button",
                 "button[aria-label='Mute']",
+                "button[aria-label='Unmute']",
                 "button[aria-label='Mute My Microphone']",
             ], timeout=3000)
             if mute_btn:
-                await mute_btn.click(force=True)
-                await log(queue, f"{tag} 🎤 Muted (pre-join).")
+                aria_label = await mute_btn.get_attribute("aria-label") or ""
+                if "Mute" in aria_label and "Unmute" not in aria_label:
+                    await mute_btn.click(force=True)
+                    await log(queue, f"{tag} 🎤 Muted (pre-join).")
+                elif "Unmute" in aria_label:
+                    await log(queue, f"{tag} 🎤 Already muted (pre-join).")
+                else:
+                    await mute_btn.click(force=True)
+                    await log(queue, f"{tag} 🎤 Mic toggled (pre-join).")
         except Exception:
             pass
 
@@ -447,7 +464,7 @@ async def join_meeting(tag: str, page, meeting_url: str, passcode: str,
         except Exception as e:
             await log(queue, f"{tag} ⚠️  Camera control error (in-meeting): {e}")
 
-        # ── 10. Mic: join audio or unmute if needed ───────────────────────
+        # ── 10. Mic: join audio and ensure muted ──────────────────────────
         try:
             mic_btn = await find_first(page, [
                 "button[aria-label='Mute']",
@@ -457,15 +474,27 @@ async def join_meeting(tag: str, page, meeting_url: str, passcode: str,
             if mic_btn:
                 aria_label = await mic_btn.get_attribute("aria-label") or ""
                 if "Unmute" in aria_label:
-                    await mic_btn.click(force=True)
-                    await log(queue, f"{tag} 🎤 Microphone unmuted (in-meeting).")
+                    await log(queue, f"{tag} 🎤 Microphone is already muted (in-meeting).")
                 elif "Join Audio" in aria_label:
                     await mic_btn.click(force=True)
                     await log(queue, f"{tag} 🎤 Joined audio (in-meeting).")
-                else:
-                    await log(queue, f"{tag} 🎤 Microphone is active (in-meeting).")
-        except Exception:
-            pass
+
+                    # wait a bit for audio to connect, then check if we need to mute
+                    await page.wait_for_timeout(2000)
+                    mute_btn = await find_first(page, [
+                        "button[aria-label='Mute']",
+                        "button[aria-label='Unmute']",
+                    ], timeout=3000)
+                    if mute_btn:
+                        mute_aria = await mute_btn.get_attribute("aria-label") or ""
+                        if "Mute" in mute_aria and "Unmute" not in mute_aria:
+                            await mute_btn.click(force=True)
+                            await log(queue, f"{tag} 🎤 Microphone muted after joining audio (in-meeting).")
+                elif "Mute" in aria_label:
+                    await mic_btn.click(force=True)
+                    await log(queue, f"{tag} 🎤 Microphone muted (in-meeting).")
+        except Exception as e:
+            await log(queue, f"{tag} ⚠️  Mic control error (in-meeting): {e}")
 
         # ── 11. Wait for admission ────────────────────────────────────────
         await log(queue, f"{tag} ⏳ Waiting to be admitted ...")
@@ -568,6 +597,8 @@ async def run_bot(session_id: str, req: BotRequest,
 
         await log(queue, f"🚀 Launching {req.num_tabs} browser(s) ...")
 
+        session_done_event = asyncio.Event()
+
         async def launch_and_join(index: int, name: str):
             tag = f"[Bot {index + 1}]"
             async with async_playwright() as p:
@@ -592,6 +623,9 @@ async def run_bot(session_id: str, req: BotRequest,
                         joined_event, winner_page, winner_lock,
                         admitted_pages, admitted_lock, queue,
                     )
+
+                    if joined_event.is_set() and winner_page.get("page") is page:
+                        await session_done_event.wait()
                 finally:
                     # Losing tabs close themselves; winner stays open
                     if not joined_event.is_set() or winner_page.get("page") is not page:
@@ -658,6 +692,10 @@ async def run_bot(session_id: str, req: BotRequest,
 
         session_record["status"] = "completed"
         save_history(history)
+
+        session_done_event.set()
+
+        await asyncio.sleep(2)
 
         # Cancel any still-running tasks (losing tabs)
         for t in tasks:
